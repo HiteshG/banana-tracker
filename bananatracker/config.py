@@ -36,7 +36,12 @@ class BananaTrackerConfig:
     class_names: List[str] = field(default_factory=list)
     track_classes: Optional[List[int]] = None
     special_classes: Optional[List[int]] = None
-    detection_conf_thresh: float = 0.25
+    detection_conf_thresh: float = 0.5  # General confidence threshold
+    detection_iou_thresh: float = 0.7   # IoU threshold for YOLO NMS
+
+    # Post-processing: Centroid-based deduplication (removes duplicate boxes for same object)
+    centroid_dedup_enabled: bool = True
+    centroid_dedup_max_distance: float = 36.0  # Max pixel distance to consider duplicates
 
     # Tracker (ByteTrack params)
     track_thresh: float = 0.6

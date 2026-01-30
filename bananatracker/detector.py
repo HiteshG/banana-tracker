@@ -43,8 +43,13 @@ class YOLOv8Detector:
         detections : np.ndarray
             Detection array of shape (N, 6): [x1, y1, x2, y2, conf, class_id]
         """
-        # Run inference
-        results = self.model(frame, verbose=False, conf=self.config.detection_conf_thresh)
+        # Run inference with confidence and IoU thresholds
+        results = self.model(
+            frame,
+            verbose=False,
+            conf=self.config.detection_conf_thresh,
+            iou=self.config.detection_iou_thresh
+        )
 
         if len(results) == 0 or results[0].boxes is None:
             return np.empty((0, 6))
@@ -64,6 +69,10 @@ class YOLOv8Detector:
 
         # Apply class filtering
         detections = self._filter_by_track_classes(detections)
+
+        # Apply centroid-based deduplication (for non-special classes)
+        if self.config.centroid_dedup_enabled:
+            detections = self._deduplicate_by_centroid(detections)
 
         # Apply special class filtering (max-conf only)
         detections = self._filter_special_classes(detections)
@@ -96,6 +105,81 @@ class YOLOv8Detector:
         mask = np.isin(class_ids, self.config.track_classes)
 
         return detections[mask]
+
+    def _deduplicate_by_centroid(self, detections: np.ndarray) -> np.ndarray:
+        """Remove duplicate detections based on centroid distance.
+
+        For non-special classes, this removes duplicate bounding boxes that
+        likely represent the same object (e.g., multiple boxes around the
+        same player). Keeps the highest-confidence detection when centroids
+        are within max_distance pixels.
+
+        Parameters
+        ----------
+        detections : np.ndarray
+            Detection array of shape (N, 6): [x1, y1, x2, y2, conf, class_id]
+
+        Returns
+        -------
+        filtered : np.ndarray
+            Filtered detection array with duplicates removed.
+        """
+        if len(detections) <= 1:
+            return detections
+
+        max_distance = self.config.centroid_dedup_max_distance
+        special_classes = self.config.special_classes or []
+
+        # Separate special and non-special class detections
+        class_ids = detections[:, 5].astype(int)
+        special_mask = np.isin(class_ids, special_classes)
+
+        special_dets = detections[special_mask]
+        non_special_dets = detections[~special_mask]
+
+        if len(non_special_dets) <= 1:
+            # Nothing to deduplicate
+            if len(special_dets) > 0 and len(non_special_dets) > 0:
+                return np.vstack([non_special_dets, special_dets])
+            elif len(special_dets) > 0:
+                return special_dets
+            return non_special_dets
+
+        # Calculate centroids for non-special detections
+        centroids = np.column_stack([
+            (non_special_dets[:, 0] + non_special_dets[:, 2]) / 2,  # cx
+            (non_special_dets[:, 1] + non_special_dets[:, 3]) / 2   # cy
+        ])
+
+        # Sort by confidence (descending) - keep higher confidence detections
+        conf_indices = np.argsort(non_special_dets[:, 4])[::-1]
+
+        keep_indices = []
+        kept_centroids = []
+
+        for idx in conf_indices:
+            centroid = centroids[idx]
+
+            if len(kept_centroids) == 0:
+                keep_indices.append(idx)
+                kept_centroids.append(centroid)
+            else:
+                # Check distance to all kept centroids
+                distances = np.linalg.norm(
+                    np.array(kept_centroids) - centroid, axis=1
+                )
+                if np.min(distances) > max_distance:
+                    keep_indices.append(idx)
+                    kept_centroids.append(centroid)
+
+        # Get deduplicated non-special detections
+        deduped_dets = non_special_dets[sorted(keep_indices)]
+
+        # Combine with special class detections
+        if len(special_dets) > 0:
+            return np.vstack([deduped_dets, special_dets])
+
+        return deduped_dets
 
     def _filter_special_classes(self, detections: np.ndarray) -> np.ndarray:
         """Filter special classes to keep only max-confidence detection.
