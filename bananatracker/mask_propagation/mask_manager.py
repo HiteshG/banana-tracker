@@ -350,7 +350,8 @@ class MaskManager:
             self.remove_masks(removed_tracks_ids)
 
             # Continue propagation
-            prediction = self.processor.step(frame_torch)
+            with torch.no_grad():
+                prediction = self.processor.step(frame_torch)
 
         self.prediction = prediction
 
@@ -441,8 +442,9 @@ class MaskManager:
 
         # Initialize Cutie with the masks
         mask_torch = self._index_numpy_to_one_hot_torch(mask, self.num_objects + 1).to(self.device)
-        _ = self.processor.step(frame_torch_prev, mask_torch[1:], idx_mask=False)
-        prediction = self.processor.step(frame_torch)
+        with torch.no_grad():
+            _ = self.processor.step(frame_torch_prev, mask_torch[1:], idx_mask=False)
+            prediction = self.processor.step(frame_torch)
 
         return prediction
 
@@ -551,10 +553,11 @@ class MaskManager:
         self.current_object_list_cutie.extend(new_object_numbers)
 
         # Incorporate new masks into Cutie memory
-        _ = self.processor.step(
-            frame_torch_prev, mask_prev_extended_torch,
-            objects=self.current_object_list_cutie, idx_mask=False
-        )
+        with torch.no_grad():
+            _ = self.processor.step(
+                frame_torch_prev, mask_prev_extended_torch,
+                objects=self.current_object_list_cutie, idx_mask=False
+            )
 
         # Update dictionaries
         self.mask_color_counter = update_tracklet_mask_dict_after_mask_addition(
