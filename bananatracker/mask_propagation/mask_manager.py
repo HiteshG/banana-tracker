@@ -555,7 +555,7 @@ class MaskManager:
         # Incorporate new masks into Cutie memory
         with torch.no_grad():
             _ = self.processor.step(
-                frame_torch_prev, mask_prev_extended_torch,
+                frame_torch_prev, mask_prev_extended_torch[1:],
                 objects=self.current_object_list_cutie, idx_mask=False
             )
 
