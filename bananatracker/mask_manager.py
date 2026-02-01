@@ -397,8 +397,10 @@ class MaskManager:
             # Convert bbox to SAM2.1 format
             bbox_sam2 = np.array([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], dtype=np.float32)
 
-            # Add to current frame_idx
-            frame_idx = self.frame_counter
+            # Use the last valid frame index from the predictor's image buffer
+            # SAM2 camera predictor only keeps a limited buffer of recent images
+            images = self.predictor.condition_state.get("images", [])
+            frame_idx = len(images) - 1 if images else 0
 
             try:
                 _, obj_ids, mask_logits = self.predictor.add_new_prompt(
