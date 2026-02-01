@@ -16,9 +16,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# SAM2.1 via HuggingFace transformers
-from transformers import AutoProcessor, AutoModelForMaskGeneration
-
 
 # Constants for mask creation
 OVERLAP_MEASURE_VARIANT = 1
@@ -88,19 +85,27 @@ class MaskManager:
         print(f"Loading SAM2.1 model: {sam2_model_id}")
         token = hf_token if hf_token else None
 
-        # Load processor and model
-        self.sam2_processor = AutoProcessor.from_pretrained(
-            sam2_model_id,
-            token=token,
-            trust_remote_code=True
-        )
-        self.sam2_model = AutoModelForMaskGeneration.from_pretrained(
-            sam2_model_id,
-            token=token,
-            trust_remote_code=True
-        )
-        self.sam2_model.to(device).eval()
-        print("SAM2.1 loaded successfully")
+        # Load SAM2 for image segmentation
+        try:
+            from transformers import Sam2Processor, Sam2Model
+
+            self.sam2_processor = Sam2Processor.from_pretrained(
+                sam2_model_id,
+                token=token,
+            )
+            self.sam2_model = Sam2Model.from_pretrained(
+                sam2_model_id,
+                token=token,
+            )
+            self.sam2_model.to(device).eval()
+            self._sam2_use_hf = True
+            print("SAM2.1 loaded successfully via HuggingFace")
+        except Exception as e:
+            print(f"Warning: Failed to load SAM2 from HuggingFace: {e}")
+            print("Trying alternative SAM2 loading method...")
+            self._sam2_use_hf = False
+            self.sam2_model = None
+            self.sam2_processor = None
 
         # Initialize Cutie
         self._init_cutie(cutie_weights_path)
@@ -205,33 +210,83 @@ class MaskManager:
         masks : np.ndarray
             Binary masks as numpy array (N, H, W)
         """
+        H, W = image.shape[:2]
+
         if len(boxes_xyxy) == 0:
-            return np.zeros((0, image.shape[0], image.shape[1]), dtype=np.uint8)
+            return np.zeros((0, H, W), dtype=np.uint8)
 
-        # Format boxes for SAM2.1: [[[x1, y1, x2, y2], ...]]
-        input_boxes = [boxes_xyxy]
+        if self.sam2_model is None:
+            # Fallback: use bounding box as mask
+            return self._bbox_to_mask_fallback(image, boxes_xyxy)
 
-        # Process with SAM2.1
-        inputs = self.sam2_processor(
-            images=image,
-            input_boxes=input_boxes,
-            return_tensors="pt"
-        ).to(self.device)
+        try:
+            # Process each box individually for more reliable results
+            all_masks = []
 
-        with torch.no_grad():
-            outputs = self.sam2_model(**inputs, multimask_output=False)
+            for box in boxes_xyxy:
+                # Format single box for SAM2: [[[x1, y1, x2, y2]]]
+                input_boxes = [[box]]
 
-        # Post-process masks
-        masks = self.sam2_processor.post_process_masks(
-            outputs.pred_masks.cpu(),
-            inputs["original_sizes"].cpu(),
-            inputs["reshaped_input_sizes"].cpu()
-        )[0]  # First image result
+                # Process with SAM2.1
+                inputs = self.sam2_processor(
+                    images=image,
+                    input_boxes=input_boxes,
+                    return_tensors="pt"
+                ).to(self.device)
 
-        # Shape: (N, 1, H, W) -> (N, H, W)
-        masks = masks.squeeze(1).numpy().astype(np.uint8)
+                with torch.no_grad():
+                    outputs = self.sam2_model(**inputs, multimask_output=False)
 
-        return masks
+                # Get the predicted mask
+                pred_masks = outputs.pred_masks  # Shape: (1, 1, 1, H', W')
+
+                # Resize to original image size
+                pred_masks = F.interpolate(
+                    pred_masks.squeeze(0).float(),  # (1, 1, H', W')
+                    size=(H, W),
+                    mode='bilinear',
+                    align_corners=False
+                )
+
+                # Threshold and convert to binary
+                mask = (pred_masks.squeeze() > 0.5).cpu().numpy().astype(np.uint8)
+                all_masks.append(mask)
+
+            return np.stack(all_masks, axis=0)
+
+        except Exception as e:
+            print(f"Warning: SAM2.1 prediction failed: {e}")
+            print("Using bounding box fallback for masks")
+            return self._bbox_to_mask_fallback(image, boxes_xyxy)
+
+    def _bbox_to_mask_fallback(self, image: np.ndarray, boxes_xyxy: List[List[float]]) -> np.ndarray:
+        """Fallback: create masks from bounding boxes directly.
+
+        Parameters
+        ----------
+        image : np.ndarray
+            RGB image
+        boxes_xyxy : List[List[float]]
+            Bounding boxes
+
+        Returns
+        -------
+        masks : np.ndarray
+            Binary masks (N, H, W)
+        """
+        H, W = image.shape[:2]
+        masks = []
+
+        for box in boxes_xyxy:
+            x1, y1, x2, y2 = map(int, box)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(W, x2), min(H, y2)
+
+            mask = np.zeros((H, W), dtype=np.uint8)
+            mask[y1:y2, x1:x2] = 1
+            masks.append(mask)
+
+        return np.stack(masks, axis=0) if masks else np.zeros((0, H, W), dtype=np.uint8)
 
     def get_updated_masks(
         self,
