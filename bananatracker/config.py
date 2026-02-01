@@ -22,6 +22,14 @@ class BananaTrackerConfig:
 
         cmc_method: Camera motion compensation method ("orb", "ecc", "sift", "sparseOptFlow", "none")
 
+        # Mask Module (SAM2.1 + Cutie)
+        enable_masks: Whether to enable mask-based tracking enhancement
+        sam2_model_id: HuggingFace model ID for SAM2.1
+        sam2_checkpoint: Local checkpoint path for SAM2.1 (optional, overrides HF download)
+        cutie_weights_path: Path to Cutie model weights
+        hf_token: HuggingFace token for model access (optional)
+        mask_start_frame: Frame to start mask processing (default 1)
+
         class_colors: Dict mapping class name to BGR color tuple
         show_track_id: Whether to display track IDs on visualization
         line_thickness: Bounding box line thickness
@@ -52,9 +60,20 @@ class BananaTrackerConfig:
     # Camera Motion Compensation
     cmc_method: str = "orb"
 
+    # Mask Module (SAM2.1 + Cutie)
+    enable_masks: bool = False
+    sam2_model_id: str = "facebook/sam2.1-hiera-large"
+    sam2_checkpoint: Optional[str] = None  # Local checkpoint path (overrides HF download)
+    cutie_weights_path: Optional[str] = None  # Path to cutie-base-mega.pth
+    hf_token: Optional[str] = None  # HuggingFace token for gated models
+    mask_start_frame: int = 1  # Frame to start mask processing
+    mask_bbox_overlap_threshold: float = 0.6  # Threshold for avoiding overlapped mask creation
+
     # Visualization
     class_colors: Dict[str, Tuple[int, int, int]] = field(default_factory=dict)
     show_track_id: bool = True
+    show_masks: bool = True  # Whether to show mask overlays when masks enabled
+    mask_alpha: float = 0.5  # Transparency for mask overlay
     line_thickness: int = 2
 
     # Output
