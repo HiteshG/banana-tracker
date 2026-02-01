@@ -90,6 +90,18 @@ class MaskManager:
         if sam2_repo_path not in sys.path:
             sys.path.insert(0, sam2_repo_path)
 
+        # Pre-import all SAM2 modules that Hydra needs to instantiate.
+        # This ensures the modules are in sys.modules before Hydra's instantiate()
+        # tries to resolve _target_ classes from the YAML config.
+        import sam2.modeling.sam2_base  # noqa: F401
+        import sam2.modeling.backbones.image_encoder  # noqa: F401
+        import sam2.modeling.backbones.hieradet  # noqa: F401
+        import sam2.modeling.position_encoding  # noqa: F401
+        import sam2.modeling.memory_attention  # noqa: F401
+        import sam2.modeling.sam.transformer  # noqa: F401
+        import sam2.modeling.memory_encoder  # noqa: F401
+        import sam2.sam2_camera_predictor  # noqa: F401
+
         # Build checkpoint and config paths
         checkpoint_path = self.config.sam2_checkpoint
         config_path = self.config.sam2_config
