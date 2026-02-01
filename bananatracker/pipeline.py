@@ -1,4 +1,4 @@
-"""Main pipeline combining detector, tracker, and visualizer.
+"""Main pipeline combining detector, tracker, mask manager, and visualizer.
 
 Usage:
     from bananatracker import BananaTrackerConfig, BananaTrackerPipeline
@@ -10,13 +10,14 @@ Usage:
 
 import cv2
 import numpy as np
-from typing import List, Optional, Tuple, Generator
+from typing import List, Optional, Tuple, Generator, Dict
 from tqdm import tqdm
 
 from .config import BananaTrackerConfig
 from .detector import YOLOv8Detector
 from .tracker import BananaTracker
 from .visualizer import TrackVisualizer, VideoWriter, MOTWriter
+from .mask_manager import MaskManager
 
 
 class BananaTrackerPipeline:
@@ -42,6 +43,22 @@ class BananaTrackerPipeline:
             cmc_method=config.cmc_method
         )
         self.visualizer = TrackVisualizer(config)
+
+        # Initialize mask manager (SAM2.1)
+        self.mask_manager = None
+        if config.sam2_enabled:
+            try:
+                self.mask_manager = MaskManager(config)
+                print("SAM2.1 mask manager initialized")
+            except Exception as e:
+                print(f"Warning: SAM2.1 initialization failed: {e}")
+                print("Continuing without mask propagation")
+
+        # State for mask tracking
+        self.prev_frame = None
+        self.current_mask = None
+        self.tracklet_mask_dict = {}
+        self.mask_avg_prob_dict = {}
 
     def process_video(self, video_path: str, show_progress: bool = True) -> List:
         """Process a video file for tracking.
@@ -91,6 +108,11 @@ class BananaTrackerPipeline:
         # Process frames
         all_tracks = []
         frame_id = 0
+        prev_frame = None
+
+        # Reset mask manager for new video
+        if self.mask_manager:
+            self.mask_manager.reset()
 
         iterator = range(total_frames)
         if show_progress:
@@ -115,6 +137,32 @@ class BananaTrackerPipeline:
                     frame_img=frame
                 )
 
+                # Update masks with SAM2.1
+                mask = None
+                tracklet_mask_dict = {}
+                mask_avg_prob_dict = {}
+
+                if self.mask_manager:
+                    # Get track positions and IDs
+                    online_tlwhs = [t.tlwh.tolist() for t in tracks]
+                    online_ids = [t.track_id for t in tracks]
+
+                    mask, tracklet_mask_dict, mask_avg_prob_dict, mask_colors = (
+                        self.mask_manager.get_updated_masks(
+                            frame=frame,
+                            frame_prev=prev_frame,
+                            frame_id=frame_id,
+                            online_tlwhs=online_tlwhs,
+                            online_ids=online_ids,
+                            new_tracks=new_tracks,
+                            removed_tracks_ids=removed_ids,
+                        )
+                    )
+
+                    # Use color-preserved mask for visualization
+                    if mask_colors is not None:
+                        mask = mask_colors
+
                 # Store tracks
                 all_tracks.append((frame_id, tracks))
 
@@ -124,8 +172,13 @@ class BananaTrackerPipeline:
 
                 # Draw visualization
                 if video_writer:
-                    vis_frame = self.visualizer.draw_tracks(frame, tracks)
+                    vis_frame = self.visualizer.draw_tracks_with_masks(
+                        frame, tracks, mask, tracklet_mask_dict
+                    )
                     video_writer.write(vis_frame)
+
+                # Store previous frame
+                prev_frame = frame.copy()
 
         finally:
             cap.release()
@@ -136,7 +189,12 @@ class BananaTrackerPipeline:
 
         return all_tracks
 
-    def process_frame(self, frame: np.ndarray, frame_id: int = None) -> Tuple[List, np.ndarray]:
+    def process_frame(
+        self,
+        frame: np.ndarray,
+        frame_id: int = None,
+        prev_frame: np.ndarray = None,
+    ) -> Tuple[List, np.ndarray, Optional[np.ndarray], Dict]:
         """Process a single frame.
 
         Parameters
@@ -145,13 +203,19 @@ class BananaTrackerPipeline:
             BGR image frame.
         frame_id : int, optional
             Frame number (auto-incremented if None).
+        prev_frame : np.ndarray, optional
+            Previous frame for mask initialization.
 
         Returns
         -------
         tracks : List[STrack]
             List of active tracks.
         vis_frame : np.ndarray
-            Frame with drawn tracks.
+            Frame with drawn tracks and masks.
+        mask : np.ndarray or None
+            Segmentation mask.
+        tracklet_mask_dict : Dict
+            Mapping from track_id to mask_id.
         """
         height, width = frame.shape[:2]
 
@@ -166,10 +230,40 @@ class BananaTrackerPipeline:
             frame_img=frame
         )
 
-        # Draw visualization
-        vis_frame = self.visualizer.draw_tracks(frame, tracks)
+        # Update masks
+        mask = None
+        tracklet_mask_dict = {}
 
-        return tracks, vis_frame
+        if self.mask_manager and frame_id is not None:
+            online_tlwhs = [t.tlwh.tolist() for t in tracks]
+            online_ids = [t.track_id for t in tracks]
+
+            mask, tracklet_mask_dict, _, mask_colors = (
+                self.mask_manager.get_updated_masks(
+                    frame=frame,
+                    frame_prev=prev_frame or self.prev_frame,
+                    frame_id=frame_id,
+                    online_tlwhs=online_tlwhs,
+                    online_ids=online_ids,
+                    new_tracks=new_tracks,
+                    removed_tracks_ids=removed_ids,
+                )
+            )
+
+            if mask_colors is not None:
+                mask = mask_colors
+
+        # Store state
+        self.prev_frame = frame.copy()
+        self.current_mask = mask
+        self.tracklet_mask_dict = tracklet_mask_dict
+
+        # Draw visualization
+        vis_frame = self.visualizer.draw_tracks_with_masks(
+            frame, tracks, mask, tracklet_mask_dict
+        )
+
+        return tracks, vis_frame, mask, tracklet_mask_dict
 
     def process_video_generator(self, video_path: str) -> Generator:
         """Process video as a generator yielding frame-by-frame results.
@@ -188,10 +282,18 @@ class BananaTrackerPipeline:
         tracks : List[STrack]
             Active tracks for this frame.
         vis_frame : np.ndarray
-            Frame with drawn tracks.
+            Frame with drawn tracks and masks.
+        mask : np.ndarray or None
+            Segmentation mask.
+        tracklet_mask_dict : Dict
+            Mapping from track_id to mask_id.
         """
         # Reset tracker
         self.tracker.reset()
+
+        # Reset mask manager
+        if self.mask_manager:
+            self.mask_manager.reset()
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -207,6 +309,7 @@ class BananaTrackerPipeline:
             self.tracker.max_time_lost = self.tracker.buffer_size
 
         frame_id = 0
+        prev_frame = None
 
         try:
             while True:
@@ -227,10 +330,38 @@ class BananaTrackerPipeline:
                     frame_img=frame
                 )
 
-                # Visualize
-                vis_frame = self.visualizer.draw_tracks(frame, tracks)
+                # Update masks
+                mask = None
+                tracklet_mask_dict = {}
 
-                yield frame_id, frame, tracks, vis_frame
+                if self.mask_manager:
+                    online_tlwhs = [t.tlwh.tolist() for t in tracks]
+                    online_ids = [t.track_id for t in tracks]
+
+                    mask, tracklet_mask_dict, _, mask_colors = (
+                        self.mask_manager.get_updated_masks(
+                            frame=frame,
+                            frame_prev=prev_frame,
+                            frame_id=frame_id,
+                            online_tlwhs=online_tlwhs,
+                            online_ids=online_ids,
+                            new_tracks=new_tracks,
+                            removed_tracks_ids=removed_ids,
+                        )
+                    )
+
+                    if mask_colors is not None:
+                        mask = mask_colors
+
+                # Visualize
+                vis_frame = self.visualizer.draw_tracks_with_masks(
+                    frame, tracks, mask, tracklet_mask_dict
+                )
+
+                # Store previous frame
+                prev_frame = frame.copy()
+
+                yield frame_id, frame, tracks, vis_frame, mask, tracklet_mask_dict
 
         finally:
             cap.release()

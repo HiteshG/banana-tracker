@@ -3,14 +3,36 @@
 Features:
 - Per-class color bounding boxes
 - Track ID display with contrasting text color
+- Mask overlay visualization with SAM2.1
 - Video writer for output
 """
 
 import cv2
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 from .config import BananaTrackerConfig
+
+
+# Color palette for mask visualization (BGR format)
+MASK_COLORS = [
+    (255, 0, 0),     # Blue
+    (0, 255, 0),     # Green
+    (0, 0, 255),     # Red
+    (255, 255, 0),   # Cyan
+    (255, 0, 255),   # Magenta
+    (0, 255, 255),   # Yellow
+    (128, 0, 255),   # Purple
+    (255, 128, 0),   # Orange
+    (0, 128, 255),   # Light Orange
+    (128, 255, 0),   # Lime
+    (255, 0, 128),   # Pink
+    (0, 255, 128),   # Spring Green
+    (128, 128, 255), # Light Purple
+    (128, 255, 255), # Light Cyan
+    (255, 128, 128), # Light Blue
+    (255, 255, 128), # Light Yellow
+]
 
 
 class TrackVisualizer:
@@ -90,6 +112,99 @@ class TrackVisualizer:
                     frame, label, (text_x + 2, text_y - 2),
                     font, font_scale, text_color, font_thickness
                 )
+
+        return frame
+
+    def draw_masks(
+        self,
+        frame: np.ndarray,
+        mask: np.ndarray,
+        tracklet_mask_dict: Optional[Dict[int, int]] = None,
+        alpha: Optional[float] = None,
+    ) -> np.ndarray:
+        """Draw mask overlays on frame.
+
+        Parameters
+        ----------
+        frame : np.ndarray
+            BGR image frame.
+        mask : np.ndarray
+            Integer mask of shape (H, W) where 0=background and >0 are object IDs.
+        tracklet_mask_dict : Dict[int, int], optional
+            Mapping from track_id to mask_id for consistent coloring.
+        alpha : float, optional
+            Transparency of mask overlay (0-1). Defaults to config.mask_alpha.
+
+        Returns
+        -------
+        frame : np.ndarray
+            Frame with mask overlays.
+        """
+        frame = frame.copy()
+
+        if mask is None or mask.max() == 0:
+            return frame
+
+        if alpha is None:
+            alpha = self.config.mask_alpha
+
+        # Create colored overlay
+        overlay = np.zeros_like(frame)
+
+        # Get unique mask IDs (excluding background)
+        unique_ids = np.unique(mask)
+        unique_ids = unique_ids[unique_ids > 0]
+
+        for mask_id in unique_ids:
+            # Get color for this mask
+            color_idx = (mask_id - 1) % len(MASK_COLORS)
+            color = MASK_COLORS[color_idx]
+
+            # Create mask region
+            mask_region = mask == mask_id
+            overlay[mask_region] = color
+
+        # Blend overlay with frame
+        mask_any = mask > 0
+        frame[mask_any] = cv2.addWeighted(
+            frame[mask_any], 1 - alpha,
+            overlay[mask_any], alpha,
+            0
+        )
+
+        return frame
+
+    def draw_tracks_with_masks(
+        self,
+        frame: np.ndarray,
+        tracks: List,
+        mask: Optional[np.ndarray] = None,
+        tracklet_mask_dict: Optional[Dict[int, int]] = None,
+    ) -> np.ndarray:
+        """Draw both masks and tracks on frame.
+
+        Parameters
+        ----------
+        frame : np.ndarray
+            BGR image frame.
+        tracks : List[STrack]
+            List of active tracks.
+        mask : np.ndarray, optional
+            Integer mask of shape (H, W).
+        tracklet_mask_dict : Dict[int, int], optional
+            Mapping from track_id to mask_id.
+
+        Returns
+        -------
+        frame : np.ndarray
+            Frame with masks and tracks drawn.
+        """
+        # Draw masks first (underneath)
+        if mask is not None:
+            frame = self.draw_masks(frame, mask, tracklet_mask_dict)
+
+        # Draw tracks on top
+        frame = self.draw_tracks(frame, tracks)
 
         return frame
 

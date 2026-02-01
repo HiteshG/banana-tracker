@@ -52,6 +52,15 @@ class BananaTrackerConfig:
     # Camera Motion Compensation
     cmc_method: str = "orb"
 
+    # SAM2.1 Mask Propagation
+    sam2_enabled: bool = True  # Enable mask generation with SAM2.1
+    sam2_checkpoint: str = "checkpoints/sam2.1_hiera_large.pt"  # SAM2.1 model checkpoint
+    sam2_config: str = "configs/sam2.1/sam2.1_hiera_l.yaml"  # SAM2.1 config yaml
+    sam2_repo_path: str = ""  # Path to segment-anything-2-real-time repo (auto-detected if empty)
+    mask_start_frame: int = 1  # Frame to start mask creation (1-indexed)
+    mask_overlap_threshold: float = 0.6  # Skip mask creation for heavily overlapping bboxes
+    mask_alpha: float = 0.4  # Mask overlay transparency for visualization
+
     # Visualization
     class_colors: Dict[str, Tuple[int, int, int]] = field(default_factory=dict)
     show_track_id: bool = True
