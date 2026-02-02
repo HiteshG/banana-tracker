@@ -585,17 +585,11 @@ class MaskManager:
         if len(mask_ids_to_be_removed) == 0:
             return
 
-        purge_activated, tmp_keep_idx, obj_keep_idx = \
-            self.processor.object_manager.purge_selected_objects(mask_ids_to_be_removed)
+        # Use InferenceCore's delete_objects which handles both object_manager and memory
+        self.processor.delete_objects(mask_ids_to_be_removed)
 
-        # Filter removed_tracks_ids to only include those in tracklet_mask_dict
-        original_removed_tracks_ids = removed_tracks_ids.copy()
-        removed_tracks_ids = [rti for rti in original_removed_tracks_ids if rti in self.tracklet_mask_dict]
-
-        if purge_activated:
-            self.processor.memory.purge_except(obj_keep_idx)
-
-        self.current_object_list_cutie = obj_keep_idx
+        # Update internal state
+        self.current_object_list_cutie = self.processor.object_manager.all_obj_ids
         self.num_objects = len(self.current_object_list_cutie)
 
         self.mask_color_counter = update_tracklet_mask_dict_after_mask_removal(
