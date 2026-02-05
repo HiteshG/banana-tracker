@@ -4,10 +4,11 @@ Adapted from McByte's McByteTracker with the following changes:
 - Renamed McByteTracker → BananaTracker
 - Added class_id attribute to STrack for per-class visualization
 - Simplified update method (removed YOLOX-specific preprocessing)
-- Removed logging (can be added back if needed)
 - Kept conditioned_assignment for future mask integration
+- OPTIMIZED: Pre-computed mask statistics, vectorized operations, debug logging
 """
 
+import logging
 import numpy as np
 from collections import deque
 import copy
@@ -17,15 +18,18 @@ from . import matching
 from .gmc import GMC
 from .basetrack import BaseTrack, TrackState
 
+# Setup logger for debug tracking
+logger = logging.getLogger("BananaTracker")
 
 # Constants for association steps
 MIN_MASK_AVG_CONF = 0.6
 MIN_MM1 = 0.9  # mc threshold
 MIN_MM2 = 0.05  # mf threshold
 
-MAX_COST_1ST_ASSOC_STEP = 0.9
-MAX_COST_2ND_ASSOC_STEP = 0.5
-MAX_COST_UNCONFIRMED_ASSOC_STEP = 0.7
+# Relaxed association cost thresholds for better tracking
+MAX_COST_1ST_ASSOC_STEP = 0.95    # More lenient first match (was 0.9)
+MAX_COST_2ND_ASSOC_STEP = 0.6     # More lenient low-conf match (was 0.5)
+MAX_COST_UNCONFIRMED_ASSOC_STEP = 0.8  # More lenient unconfirmed (was 0.7)
 
 
 class STrack(BaseTrack):
@@ -58,6 +62,9 @@ class STrack(BaseTrack):
         # Store last detection for visualization
         self.last_det_tlwh = tlwh
 
+        # Grace period counter for unconfirmed tracks (gives 4 frames before removal)
+        self.unconfirmed_frames = 0
+
     def predict(self):
         """Predict the next state using Kalman filter."""
         mean_state = self.mean.copy()
@@ -68,14 +75,16 @@ class STrack(BaseTrack):
 
     @staticmethod
     def multi_predict(stracks):
-        """Predict next states for multiple tracks (vectorized)."""
+        """Predict next states for multiple tracks (VECTORIZED)."""
         if len(stracks) > 0:
             multi_mean = np.asarray([st.mean.copy() for st in stracks])
             multi_covariance = np.asarray([st.covariance for st in stracks])
-            for i, st in enumerate(stracks):
-                if st.state != TrackState.Tracked:
-                    multi_mean[i][6] = 0
-                    multi_mean[i][7] = 0
+
+            # VECTORIZED: Set velocity to 0 for non-tracked states
+            states = np.array([st.state for st in stracks])
+            non_tracked_mask = states != TrackState.Tracked
+            multi_mean[non_tracked_mask, 6:8] = 0  # Zero velocity for lost tracks
+
             multi_mean, multi_covariance = STrack.shared_kalman.multi_predict(multi_mean, multi_covariance)
             for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
                 stracks[i].mean = mean
@@ -244,7 +253,7 @@ class BananaTracker:
 
         self.frame_id = 0
         self.track_thresh = track_thresh
-        self.det_thresh = track_thresh + 0.1
+        self.det_thresh = track_thresh  # Same as track_thresh (lowered from track_thresh + 0.1)
         self.buffer_size = int(frame_rate / 30.0 * track_buffer)
         self.max_time_lost = self.buffer_size
         self.match_thresh = match_thresh
@@ -252,6 +261,9 @@ class BananaTracker:
 
         # Camera motion compensation
         self.gmc = GMC(method=cmc_method, verbose=None)
+
+        # Debug tracking flag
+        self.debug_tracking = False
 
     def reset(self):
         """Reset the tracker state."""
@@ -263,7 +275,7 @@ class BananaTracker:
 
     def conditioned_assignment(self, dists, max_cost, strack_pool, detections,
                                prediction_mask, tracklet_mask_dict, mask_avg_prob_dict, img_info):
-        """Perform assignment with optional mask-based cost enrichment.
+        """Perform assignment with optional mask-based cost enrichment (OPTIMIZED).
 
         When mask parameters are None or empty, behaves as standard ByteTrack.
         When masks are provided, enriches cost matrix with mask metrics (mc, mf).
@@ -301,60 +313,67 @@ class BananaTracker:
         dists_cp = np.copy(dists)
 
         # Skip mask processing if no masks provided
-        if prediction_mask is None or tracklet_mask_dict is None or mask_avg_prob_dict is None:
+        if prediction_mask is None or tracklet_mask_dict is None or len(tracklet_mask_dict) == 0:
             matches, u_track, u_detection = matching.linear_assignment(dists_cp, thresh=max_cost)
             return matches, u_track, u_detection, dists_cp
 
-        if len(tracklet_mask_dict) == 0:
-            matches, u_track, u_detection = matching.linear_assignment(dists_cp, thresh=max_cost)
-            return matches, u_track, u_detection, dists_cp
+        # PRE-COMPUTE ALL MASK STATISTICS ONCE (avoid np.unique inside loop)
+        visible_mask_ids = set(np.unique(prediction_mask)) - {0}
+        mask_stats = {}
+        for mask_id in visible_mask_ids:
+            if mask_avg_prob_dict is not None and mask_avg_prob_dict.get(mask_id, 0) >= MIN_MASK_AVG_CONF:
+                mask_pixels = (prediction_mask == mask_id)
+                mask_stats[mask_id] = {
+                    'total': mask_pixels.sum(),
+                    'pixels': mask_pixels
+                }
 
-        # Process each entry in the cost matrix
+        img_h, img_w = img_info[0], img_info[1]
+
+        # Build track-to-mask mapping once
+        track_mask_map = {}
+        for i, strack in enumerate(strack_pool):
+            strack_id = strack.track_id
+            if strack_id in tracklet_mask_dict:
+                mask_id = tracklet_mask_dict[strack_id]
+                if mask_id in mask_stats:
+                    track_mask_map[i] = (mask_id, mask_stats[mask_id])
+
+        # Process cost matrix
         for i in range(dists_cp.shape[0]):
             for j in range(dists_cp.shape[1]):
-                if dists[i, j] <= max_cost:
-                    # Check if there are other entries meeting the threshold
-                    if not (sum(dists[i, :] <= max_cost) > 1 or sum(dists[:, j] <= max_cost) > 1):
-                        # Clear match - set all others to high cost
-                        dists_cp[i, :] += 10
-                        dists_cp[:, j] += 10
-                        dists_cp[i, j] = dists[i, j]
-                    else:
-                        # Ambiguous match - use mask cue if available
-                        strack = strack_pool[i]
-                        det = detections[j]
+                if dists[i, j] > max_cost:
+                    continue
 
-                        strack_id = strack.track_id
-                        if strack_id in tracklet_mask_dict:
-                            strack_mask_id = tracklet_mask_dict[strack_id]
+                # Check if there are other entries meeting the threshold
+                if not (np.sum(dists[i, :] <= max_cost) > 1 or np.sum(dists[:, j] <= max_cost) > 1):
+                    # Clear match - set all others to high cost
+                    dists_cp[i, :] += 10
+                    dists_cp[:, j] += 10
+                    dists_cp[i, j] = dists[i, j]
+                else:
+                    # Ambiguous match - use mask cue if available
+                    if i not in track_mask_map:
+                        continue
 
-                            # Check if mask is visible on scene
-                            if strack_mask_id in list(np.unique(prediction_mask))[1:]:
-                                # Check mask confidence
-                                if mask_avg_prob_dict.get(strack_mask_id, 0) >= MIN_MASK_AVG_CONF:
-                                    img_h, img_w = img_info[0], img_info[1]
+                    mask_id, stats = track_mask_map[i]
+                    mask_total = stats['total']
+                    mask_pixels = stats['pixels']
 
-                                    # Get detection coordinates
-                                    x, y, w, h = det.tlwh
-                                    x = max(0, int(x))
-                                    y = max(0, int(y))
-                                    w = int(w)
-                                    h = int(h)
-                                    hor_bound = min(img_w, x + w)
-                                    ver_bound = min(img_h, y + h)
+                    det = detections[j]
+                    x, y, w, h = det.tlwh
+                    x, y = max(0, int(x)), max(0, int(y))
+                    hor_bound = min(img_w, x + int(w))
+                    ver_bound = min(img_h, y + int(h))
+                    box_area = (ver_bound - y) * (hor_bound - x)
 
-                                    # Compute mc and mf
-                                    mask_in_box = (prediction_mask[y:ver_bound, x:hor_bound] == strack_mask_id).sum()
-                                    mask_total = (prediction_mask == strack_mask_id).sum()
-                                    box_area = (ver_bound - y) * (hor_bound - x)
+                    if box_area > 0 and mask_total > 0:
+                        mask_in_box = mask_pixels[y:ver_bound, x:hor_bound].sum()
+                        mc = mask_in_box / mask_total
+                        mf = mask_in_box / box_area
 
-                                    if mask_total > 0 and box_area > 0:
-                                        mask_match_opt_1 = mask_in_box / mask_total  # mc
-                                        mask_match_opt_2 = mask_in_box / box_area  # mf
-
-                                        # Apply mask cue if conditions met
-                                        if mask_match_opt_2 >= MIN_MM2 and mask_match_opt_1 >= MIN_MM1:
-                                            dists_cp[i, j] -= mask_match_opt_2
+                        if mf >= MIN_MM2 and mc >= MIN_MM1:
+                            dists_cp[i, j] -= mf
 
         # Perform Hungarian matching
         matches, u_track, u_detection = matching.linear_assignment(dists_cp, thresh=max_cost)
@@ -517,6 +536,8 @@ class BananaTracker:
             if track.state != TrackState.Lost:
                 track.mark_lost()
                 lost_stracks.append(track)
+                if self.debug_tracking:
+                    logger.debug(f"Track {track.track_id} LOST: frame={self.frame_id}, last_conf={track.score:.2f}")
 
         # Step 4: Deal with unconfirmed tracks
         detections = [detections[i] for i in u_detection]
@@ -536,16 +557,24 @@ class BananaTracker:
 
         for it in u_unconfirmed:
             track = unconfirmed[it]
-            track.mark_removed()
-            removed_stracks.append(track)
+            track.unconfirmed_frames += 1
+            if track.unconfirmed_frames > 3:  # 4-frame grace period (was 1 frame)
+                track.mark_removed()
+                removed_stracks.append(track)
+                if self.debug_tracking:
+                    logger.debug(f"Track {track.track_id} REMOVED: unconfirmed_frames={track.unconfirmed_frames}")
 
         # Step 5: Initialize new tracks
         for inew in u_detection:
             track = detections[inew]
             if track.score < self.det_thresh:
+                if self.debug_tracking:
+                    logger.debug(f"Detection REJECTED: conf={track.score:.2f} < thresh={self.det_thresh:.2f}")
                 continue
             track.activate(self.kalman_filter, self.frame_id)
             activated_stracks.append(track)
+            if self.debug_tracking:
+                logger.debug(f"Track {track.track_id} CREATED: conf={track.score:.2f}")
 
         # Step 6: Update state
         for track in self.lost_stracks:

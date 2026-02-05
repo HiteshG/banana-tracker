@@ -238,15 +238,15 @@ class BananaTrackerPipeline:
         vis_frame : np.ndarray
             Frame with drawn tracks and optional masks
         """
-        vis_frame = frame.copy()
+        vis_frame = frame.copy()  # Single copy here
 
         # Draw mask overlay if enabled and available
         if (self.config.show_masks and self.mask_colors is not None and
             self.mask_manager is not None):
             vis_frame = self._overlay_masks(vis_frame, self.mask_colors)
 
-        # Draw track boxes and IDs
-        vis_frame = self.visualizer.draw_tracks(vis_frame, tracks)
+        # Draw track boxes and IDs (no copy needed, already copied above)
+        vis_frame = self.visualizer.draw_tracks(vis_frame, tracks, copy=False)
 
         return vis_frame
 

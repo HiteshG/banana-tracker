@@ -196,7 +196,7 @@ class MaskManager:
         return None
 
     def _sam2_predict_boxes(self, image: np.ndarray, boxes_xyxy: List[List[float]]) -> np.ndarray:
-        """Generate masks for multiple bounding boxes using SAM2.1.
+        """Generate masks for multiple bounding boxes using SAM2.1 (BATCHED).
 
         Parameters
         ----------
@@ -220,14 +220,55 @@ class MaskManager:
             return self._bbox_to_mask_fallback(image, boxes_xyxy)
 
         try:
-            # Process each box individually for more reliable results
+            # BATCH ALL BOXES IN ONE CALL for better performance
+            input_boxes = [[[box[0], box[1], box[2], box[3]]] for box in boxes_xyxy]
+
+            inputs = self.sam2_processor(
+                images=[image] * len(boxes_xyxy),
+                input_boxes=input_boxes,
+                return_tensors="pt"
+            ).to(self.device)
+
+            with torch.no_grad():
+                outputs = self.sam2_model(**inputs, multimask_output=False)
+
+            pred_masks = outputs.pred_masks  # (N, 1, 1, H', W')
+            pred_masks = F.interpolate(
+                pred_masks.squeeze(2).float(),  # (N, 1, H', W')
+                size=(H, W),
+                mode='bilinear',
+                align_corners=False
+            )
+            masks = (pred_masks.squeeze(1) > 0.5).cpu().numpy().astype(np.uint8)
+            return masks
+
+        except Exception as e:
+            print(f"Batch SAM2 failed: {e}, falling back to sequential")
+            return self._sam2_predict_boxes_sequential(image, boxes_xyxy)
+
+    def _sam2_predict_boxes_sequential(self, image: np.ndarray, boxes_xyxy: List[List[float]]) -> np.ndarray:
+        """Sequential fallback for SAM2.1 mask generation (one box at a time).
+
+        Parameters
+        ----------
+        image : np.ndarray
+            RGB image as numpy array (H, W, 3)
+        boxes_xyxy : List[List[float]]
+            List of [x1, y1, x2, y2] bounding boxes
+
+        Returns
+        -------
+        masks : np.ndarray
+            Binary masks as numpy array (N, H, W)
+        """
+        H, W = image.shape[:2]
+
+        try:
             all_masks = []
 
             for box in boxes_xyxy:
-                # Format single box for SAM2: [[[x1, y1, x2, y2]]]
                 input_boxes = [[box]]
 
-                # Process with SAM2.1
                 inputs = self.sam2_processor(
                     images=image,
                     input_boxes=input_boxes,
@@ -237,25 +278,21 @@ class MaskManager:
                 with torch.no_grad():
                     outputs = self.sam2_model(**inputs, multimask_output=False)
 
-                # Get the predicted mask
                 pred_masks = outputs.pred_masks  # Shape: (1, 1, 1, H', W')
-
-                # Resize to original image size
                 pred_masks = F.interpolate(
-                    pred_masks.squeeze(0).float(),  # (1, 1, H', W')
+                    pred_masks.squeeze(0).float(),
                     size=(H, W),
                     mode='bilinear',
                     align_corners=False
                 )
 
-                # Threshold and convert to binary
                 mask = (pred_masks.squeeze() > 0.5).cpu().numpy().astype(np.uint8)
                 all_masks.append(mask)
 
             return np.stack(all_masks, axis=0)
 
         except Exception as e:
-            print(f"Warning: SAM2.1 prediction failed: {e}")
+            print(f"Warning: SAM2.1 sequential prediction failed: {e}")
             print("Using bounding box fallback for masks")
             return self._bbox_to_mask_fallback(image, boxes_xyxy)
 
