@@ -44,7 +44,7 @@ class BananaTrackerConfig:
     class_names: List[str] = field(default_factory=list)
     track_classes: Optional[List[int]] = None
     special_classes: Optional[List[int]] = None
-    detection_conf_thresh: float = 0.5  # General confidence threshold
+    detection_conf_thresh: float = 0.4  # General confidence threshold (lowered to catch more objects)
     detection_iou_thresh: float = 0.7   # IoU threshold for YOLO NMS
 
     # Post-processing: Centroid-based deduplication (removes duplicate boxes for same object)
@@ -52,10 +52,13 @@ class BananaTrackerConfig:
     centroid_dedup_max_distance: float = 36.0  # Max pixel distance to consider duplicates
 
     # Tracker (ByteTrack params)
-    track_thresh: float = 0.6
-    track_buffer: int = 30
+    track_thresh: float = 0.5  # Lowered to match more detections in first pass
+    track_buffer: int = 90  # Increased to 3 seconds at 30fps for better occlusion handling
     match_thresh: float = 0.8
     fps: int = 30
+
+    # Lost track recovery
+    lost_track_buffer_scale: float = 0.3  # Expand bbox by 30% for lost track matching
 
     # Camera Motion Compensation
     cmc_method: str = "orb"
@@ -80,6 +83,9 @@ class BananaTrackerConfig:
     output_video_path: Optional[str] = None
     output_txt_path: Optional[str] = None
     device: str = "cuda:0"
+
+    # Debug
+    debug_tracking: bool = False  # Enable verbose tracking logs
 
     def get_color_for_class(self, class_id: int) -> Tuple[int, int, int]:
         """Get the BGR color for a given class ID."""

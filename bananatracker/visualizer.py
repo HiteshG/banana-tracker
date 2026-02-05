@@ -26,7 +26,7 @@ class TrackVisualizer:
         """
         self.config = config
 
-    def draw_tracks(self, frame: np.ndarray, tracks: List) -> np.ndarray:
+    def draw_tracks(self, frame: np.ndarray, tracks: List, copy: bool = True) -> np.ndarray:
         """Draw bounding boxes and track IDs on frame.
 
         Parameters
@@ -35,13 +35,17 @@ class TrackVisualizer:
             BGR image frame.
         tracks : List[STrack]
             List of active tracks.
+        copy : bool
+            Whether to copy the frame before drawing. Set to False if caller
+            already made a copy to avoid redundant memory allocation.
 
         Returns
         -------
         frame : np.ndarray
             Frame with drawn tracks.
         """
-        frame = frame.copy()
+        if copy:
+            frame = frame.copy()
 
         for track in tracks:
             # Get bounding box
