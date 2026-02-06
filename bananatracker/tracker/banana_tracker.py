@@ -23,9 +23,9 @@ MIN_MASK_AVG_CONF = 0.6
 MIN_MM1 = 0.9  # mc threshold
 MIN_MM2 = 0.05  # mf threshold
 
-MAX_COST_1ST_ASSOC_STEP = 0.9
-MAX_COST_2ND_ASSOC_STEP = 0.5
-MAX_COST_UNCONFIRMED_ASSOC_STEP = 0.7
+MAX_COST_1ST_ASSOC_STEP = 0.95    # More lenient first match
+MAX_COST_2ND_ASSOC_STEP = 0.6     # More lenient low-conf match
+MAX_COST_UNCONFIRMED_ASSOC_STEP = 0.8  # More lenient unconfirmed
 
 
 class STrack(BaseTrack):
@@ -54,6 +54,7 @@ class STrack(BaseTrack):
         self.score = score
         self.tracklet_len = 0
         self.class_id = class_id
+        self.unconfirmed_frames = 0  # Grace period counter for unconfirmed tracks
 
         # Store last detection for visualization
         self.last_det_tlwh = tlwh
@@ -244,8 +245,9 @@ class BananaTracker:
 
         self.frame_id = 0
         self.track_thresh = track_thresh
-        self.det_thresh = track_thresh + 0.1
-        self.buffer_size = int(frame_rate / 30.0 * track_buffer)
+        self.det_thresh = track_thresh  # Same as track_thresh for more track creation
+        # Cap buffer at 45 frames max to avoid memory issues
+        self.buffer_size = min(int(frame_rate / 30.0 * track_buffer), 45)
         self.max_time_lost = self.buffer_size
         self.match_thresh = match_thresh
         self.kalman_filter = KalmanFilter()
@@ -465,8 +467,37 @@ class BananaTracker:
             except Exception:
                 pass
 
-        # Compute IoU distance
-        dists = matching.iou_distance(strack_pool, detections)
+        # Separate lost and tracked for different IoU treatment
+        lost_tracks = [t for t in strack_pool if t.state == TrackState.Lost]
+        active_tracks = [t for t in strack_pool if t.state == TrackState.Tracked]
+
+        # Compute IoU distance (use buffered IoU for lost tracks)
+        if len(active_tracks) > 0 and len(detections) > 0:
+            dists_active = matching.iou_distance(active_tracks, detections)
+        else:
+            dists_active = np.empty((0, len(detections)))
+
+        if len(lost_tracks) > 0 and len(detections) > 0:
+            # Use buffered IoU for lost tracks (30% expansion for better re-association)
+            dists_lost = matching.buffered_iou_distance(lost_tracks, detections, buffer_scale=0.3)
+        else:
+            dists_lost = np.empty((0, len(detections)))
+
+        # Combine cost matrices and reconstruct strack_pool order
+        combined_tracks = active_tracks + lost_tracks
+        if len(dists_active) > 0 or len(dists_lost) > 0:
+            dists = np.vstack([dists_active, dists_lost]) if len(dists_active) > 0 and len(dists_lost) > 0 else (dists_active if len(dists_active) > 0 else dists_lost)
+        else:
+            dists = np.empty((0, len(detections)))
+
+        # Update strack_pool to match combined order
+        strack_pool = combined_tracks
+
+        # Add motion gating to reject impossible matches
+        dists = matching.gate_cost_matrix(
+            self.kalman_filter, dists, strack_pool, detections, only_position=False
+        )
+
         dists = matching.fuse_score(dists, detections)
 
         # Conditioned assignment (with mask support)
@@ -536,8 +567,11 @@ class BananaTracker:
 
         for it in u_unconfirmed:
             track = unconfirmed[it]
-            track.mark_removed()
-            removed_stracks.append(track)
+            track.unconfirmed_frames += 1
+            if track.unconfirmed_frames > 3:  # 4-frame grace period
+                track.mark_removed()
+                removed_stracks.append(track)
+            # else: keep in unconfirmed pool for next frame
 
         # Step 5: Initialize new tracks
         for inew in u_detection:

@@ -163,6 +163,10 @@ class GMC:
         # Run the ECC algorithm
         try:
             (cc, H) = cv2.findTransformECC(self.prevFrame, frame, H, self.warp_mode, self.criteria, None, 1)
+            # Scale translation back to original image size
+            if self.downscale > 1.0:
+                H[0, 2] *= self.downscale
+                H[1, 2] *= self.downscale
         except Exception:
             pass  # Return identity on failure
 

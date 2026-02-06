@@ -44,7 +44,7 @@ class BananaTrackerConfig:
     class_names: List[str] = field(default_factory=list)
     track_classes: Optional[List[int]] = None
     special_classes: Optional[List[int]] = None
-    detection_conf_thresh: float = 0.5  # General confidence threshold
+    detection_conf_thresh: float = 0.4  # Lower threshold to catch more objects
     detection_iou_thresh: float = 0.7   # IoU threshold for YOLO NMS
 
     # Post-processing: Centroid-based deduplication (removes duplicate boxes for same object)
@@ -52,13 +52,15 @@ class BananaTrackerConfig:
     centroid_dedup_max_distance: float = 36.0  # Max pixel distance to consider duplicates
 
     # Tracker (ByteTrack params)
-    track_thresh: float = 0.6
-    track_buffer: int = 30
+    track_thresh: float = 0.5  # Lower to match more in first pass
+    track_buffer: int = 90  # 3 seconds at 30fps for long occlusions
     match_thresh: float = 0.8
-    fps: int = 30
+
+    # Lost track recovery
+    lost_track_buffer_scale: float = 0.3  # Expand bbox by 30% for lost track matching
 
     # Camera Motion Compensation
-    cmc_method: str = "orb"
+    cmc_method: str = "ecc"  # Enhanced correlation coefficient - more accurate
 
     # Mask Module (SAM2.1 + Cutie)
     enable_masks: bool = False
