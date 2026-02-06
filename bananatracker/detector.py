@@ -24,10 +24,14 @@ class YOLOv8Detector:
             Configuration object with detector settings.
         """
         self.config = config
-        self.model = YOLO(config.yolo_weights)
+        self.model = YOLO(config.yolo_weights, task='detect')
 
-        # Move to device
-        if config.device.startswith('cuda'):
+        # Check if this is a PyTorch model (can use .to())
+        # ONNX/TensorRT models don't support .to() - device is passed at inference
+        self._is_pytorch_model = config.yolo_weights.endswith('.pt')
+
+        # Move to device (only for PyTorch models)
+        if self._is_pytorch_model and config.device.startswith('cuda'):
             self.model.to(config.device)
 
     def detect(self, frame: np.ndarray) -> np.ndarray:
@@ -44,12 +48,16 @@ class YOLOv8Detector:
             Detection array of shape (N, 6): [x1, y1, x2, y2, conf, class_id]
         """
         # Run inference with confidence and IoU thresholds
-        results = self.model(
-            frame,
-            verbose=False,
-            conf=self.config.detection_conf_thresh,
-            iou=self.config.detection_iou_thresh
-        )
+        # For ONNX/TensorRT models, device must be passed at inference time
+        inference_kwargs = {
+            'verbose': False,
+            'conf': self.config.detection_conf_thresh,
+            'iou': self.config.detection_iou_thresh
+        }
+        if not self._is_pytorch_model:
+            inference_kwargs['device'] = self.config.device
+
+        results = self.model(frame, **inference_kwargs)
 
         if len(results) == 0 or results[0].boxes is None:
             return np.empty((0, 6))
