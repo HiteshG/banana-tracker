@@ -4,6 +4,7 @@ Ported from McByte and enhanced with BoxMOT improvements:
 - Detection masking: excludes detected objects from keypoint matching
 - Lowe's ratio test: better match filtering (0.9 threshold)
 - Spatial gating: rejects matches with large spatial distance (2.5 sigma)
+- ECC: Reimplemented following BoxMOT's optimized pattern
 """
 
 import copy
@@ -23,7 +24,18 @@ class GMC:
     - none: No compensation (identity matrix)
     """
 
-    def __init__(self, method: str = 'orb', downscale: int = 2, verbose=None):
+    def __init__(
+        self,
+        method: str = 'orb',
+        downscale: int = 2,
+        verbose=None,
+        # ECC-specific parameters (following BoxMOT pattern)
+        ecc_max_iterations: int = 100,
+        ecc_eps: float = 1e-5,
+        ecc_scale: float = 0.25,  # 4x downscale
+        ecc_warp_mode: int = cv2.MOTION_EUCLIDEAN,
+        grayscale: bool = True
+    ):
         """Initialize GMC.
 
         Parameters
@@ -31,12 +43,23 @@ class GMC:
         method : str
             Method for motion estimation: 'orb', 'sift', 'ecc', 'sparseOptFlow', 'none'
         downscale : int
-            Downscale factor for processing (higher = faster, less accurate)
+            Downscale factor for ORB/SIFT/sparseOptFlow (higher = faster, less accurate)
         verbose : optional
             Additional parameters for 'file' method
+        ecc_max_iterations : int
+            Maximum iterations for ECC algorithm (default: 100)
+        ecc_eps : float
+            Termination epsilon for ECC (default: 1e-5)
+        ecc_scale : float
+            Scale factor for ECC (0.25 = 4x downscale, 0.15 = ~6.6x downscale)
+        ecc_warp_mode : int
+            OpenCV warp mode for ECC (MOTION_TRANSLATION, MOTION_EUCLIDEAN, MOTION_AFFINE, MOTION_HOMOGRAPHY)
+        grayscale : bool
+            Whether to convert to grayscale for ECC
         """
         self.method = method
         self.downscale = max(1, int(downscale))
+        self.grayscale = grayscale
 
         if self.method == 'orb':
             self.detector = cv2.FastFeatureDetector_create(20)
@@ -49,10 +72,14 @@ class GMC:
             self.matcher = cv2.BFMatcher(cv2.NORM_L2)
 
         elif self.method == 'ecc':
-            number_of_iterations = 5000
-            termination_eps = 1e-6
-            self.warp_mode = cv2.MOTION_EUCLIDEAN
-            self.criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, number_of_iterations, termination_eps)
+            # ECC parameters following BoxMOT pattern
+            self.ecc_scale = float(ecc_scale)
+            self.warp_mode = int(ecc_warp_mode)
+            self.criteria = (
+                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                int(ecc_max_iterations),
+                float(ecc_eps)
+            )
 
         elif self.method == 'sparseOptFlow':
             self.feature_params = dict(
@@ -144,34 +171,99 @@ class GMC:
 
         return mask
 
-    def applyEcc(self, raw_frame: np.ndarray, detections: Optional[np.ndarray] = None) -> np.ndarray:
-        """Apply ECC-based motion compensation."""
-        height, width, _ = raw_frame.shape
-        frame = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
-        H = np.eye(2, 3, dtype=np.float32)
+    def _preprocess_ecc(self, img: np.ndarray) -> np.ndarray:
+        """Preprocess image for ECC (following BoxMOT pattern).
 
-        if self.downscale > 1.0:
-            frame = cv2.GaussianBlur(frame, (3, 3), 1.5)
-            frame = cv2.resize(frame, (width // self.downscale, height // self.downscale))
+        Parameters
+        ----------
+        img : np.ndarray
+            BGR input image
+
+        Returns
+        -------
+        processed : np.ndarray
+            Grayscale and scaled image ready for ECC
+        """
+        # Convert to grayscale if needed
+        if self.grayscale and len(img.shape) == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Scale image
+        if self.ecc_scale < 1.0:
+            h, w = img.shape[:2]
+            new_w = int(w * self.ecc_scale)
+            new_h = int(h * self.ecc_scale)
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+        return img
+
+    def applyEcc(self, raw_frame: np.ndarray, detections: Optional[np.ndarray] = None) -> np.ndarray:
+        """Apply ECC-based motion compensation (BoxMOT pattern).
+
+        Uses OpenCV's findTransformECC for frame-to-frame motion estimation.
+        Produces 2x3 affine-like matrix for TRANSLATION/EUCLIDEAN/AFFINE,
+        or 3x3 homography matrix for HOMOGRAPHY mode.
+
+        Parameters
+        ----------
+        raw_frame : np.ndarray
+            BGR input frame
+        detections : np.ndarray, optional
+            Detection boxes (not used in ECC, kept for API consistency)
+
+        Returns
+        -------
+        warp_matrix : np.ndarray
+            2x3 or 3x3 transformation matrix
+        """
+        # Initialize warp matrix based on warp mode
+        if self.warp_mode == cv2.MOTION_HOMOGRAPHY:
+            warp_matrix = np.eye(3, 3, dtype=np.float32)
+        else:
+            warp_matrix = np.eye(2, 3, dtype=np.float32)
+
+        # Preprocess current frame
+        curr = self._preprocess_ecc(raw_frame)
 
         # Handle first frame
         if not self.initializedFirstFrame:
-            self.prevFrame = frame.copy()
+            self.prevFrame = curr.copy()
             self.initializedFirstFrame = True
-            return H
+            return warp_matrix
 
-        # Run the ECC algorithm
+        # Run ECC algorithm
         try:
-            (cc, H) = cv2.findTransformECC(self.prevFrame, frame, H, self.warp_mode, self.criteria, None, 1)
-            # Scale translation back to original image size
-            if self.downscale > 1.0:
-                H[0, 2] *= self.downscale
-                H[1, 2] *= self.downscale
-        except Exception:
-            pass  # Return identity on failure
+            _, warp_matrix = cv2.findTransformECC(
+                self.prevFrame,
+                curr,
+                warp_matrix,
+                self.warp_mode,
+                self.criteria,
+                None,  # inputMask
+                1      # gaussFiltSize
+            )
+        except cv2.error as e:
+            # Handle non-convergence gracefully (BoxMOT pattern)
+            try:
+                if e.code == cv2.Error.StsNoConv:
+                    # ECC did not converge - return identity and update prevFrame
+                    self.prevFrame = curr.copy()
+                    return warp_matrix
+            except AttributeError:
+                pass
+            # For other errors, also return identity
+            self.prevFrame = curr.copy()
+            return warp_matrix
 
-        self.prevFrame = frame.copy()
-        return H
+        # Scale translation components back to original image size
+        if self.ecc_scale < 1.0:
+            warp_matrix = warp_matrix.copy()
+            warp_matrix[0, 2] /= self.ecc_scale
+            warp_matrix[1, 2] /= self.ecc_scale
+
+        # Update previous frame
+        self.prevFrame = curr.copy()
+        return warp_matrix
 
     def applyFeatures(self, raw_frame: np.ndarray, detections: Optional[np.ndarray] = None) -> np.ndarray:
         """Apply feature-based motion compensation (ORB/SIFT).

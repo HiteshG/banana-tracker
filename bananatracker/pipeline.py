@@ -40,7 +40,11 @@ class BananaTrackerPipeline:
             track_buffer=config.track_buffer,
             match_thresh=config.match_thresh,
             frame_rate=30,  # Default, updated dynamically from video
-            cmc_method=config.cmc_method
+            cmc_method=config.cmc_method,
+            cmc_downscale=config.cmc_downscale,
+            ecc_max_iterations=config.ecc_max_iterations,
+            ecc_eps=config.ecc_termination_eps,
+            ecc_scale=config.ecc_downscale
         )
         self.visualizer = TrackVisualizer(config)
 
@@ -56,7 +60,8 @@ class BananaTrackerPipeline:
                     device=config.device,
                     hf_token=config.hf_token,
                     mask_start_frame=config.mask_start_frame,
-                    bbox_overlap_threshold=config.mask_bbox_overlap_threshold
+                    bbox_overlap_threshold=config.mask_bbox_overlap_threshold,
+                    use_fp16=config.sam2_use_fp16
                 )
                 print("Mask module (SAM2.1 + Cutie) initialized successfully")
             except Exception as e:
@@ -304,6 +309,126 @@ class BananaTrackerPipeline:
         overlayed[binary_mask] = foreground[binary_mask].astype(np.uint8)
 
         return overlayed
+
+    def process_video_batched(self, video_path: str, batch_size: int = None,
+                               show_progress: bool = True) -> List:
+        """Process a video file with batched detection for GPU efficiency.
+
+        Parameters
+        ----------
+        video_path : str
+            Path to input video file.
+        batch_size : int, optional
+            Batch size for detection (defaults to config.detection_batch_size).
+        show_progress : bool
+            Whether to show progress bar.
+
+        Returns
+        -------
+        all_tracks : List
+            List of (frame_id, tracks) tuples for all frames.
+        """
+        if batch_size is None:
+            batch_size = self.config.detection_batch_size
+
+        # Reset tracker for new video
+        self.tracker.reset()
+        self._reset_mask_state()
+
+        # Open video
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Could not open video: {video_path}")
+
+        # Get video properties
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # Update buffer size based on actual video fps, capped at 45 frames
+        self.tracker.buffer_size = min(int(fps / 30.0 * self.config.track_buffer), 45)
+        self.tracker.max_time_lost = self.tracker.buffer_size
+
+        # Setup output writers
+        video_writer = None
+        mot_writer = None
+
+        if self.config.output_video_path:
+            video_writer = VideoWriter(self.config.output_video_path, fps=fps)
+
+        if self.config.output_txt_path:
+            mot_writer = MOTWriter(self.config.output_txt_path)
+            mot_writer.open()
+
+        # Process frames
+        all_tracks = []
+        frame_id = 0
+
+        if show_progress:
+            pbar = tqdm(total=total_frames, desc="Processing (batched)", unit="frame")
+
+        try:
+            while True:
+                # Fill frame buffer
+                frame_buffer = []
+                frame_ids = []
+
+                for _ in range(batch_size):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    frame_id += 1
+                    frame_buffer.append(frame)
+                    frame_ids.append(frame_id)
+
+                if not frame_buffer:
+                    break
+
+                # Batch detect all frames at once (GPU efficient!)
+                all_detections = self.detector.detect_batch(frame_buffer)
+
+                # Process each frame through tracker (must be sequential)
+                for frame, detections, fid in zip(frame_buffer, all_detections, frame_ids):
+                    img_info = (height, width)
+                    tracks, removed_ids, new_tracks = self.tracker.update(
+                        detections_array=detections,
+                        img_info=img_info,
+                        prediction_mask=self.prediction_mask,
+                        tracklet_mask_dict=self.tracklet_mask_dict,
+                        mask_avg_prob_dict=self.mask_avg_prob_dict,
+                        frame_img=frame
+                    )
+
+                    # Update masks if enabled
+                    if self.mask_manager is not None:
+                        self._update_masks(frame, fid, tracks, new_tracks, removed_ids)
+
+                    # Store tracks
+                    all_tracks.append((fid, tracks))
+
+                    # Write MOT format
+                    if mot_writer:
+                        mot_writer.write_frame(fid, tracks)
+
+                    # Draw visualization with optional mask overlay
+                    if video_writer:
+                        vis_frame = self._draw_with_masks(frame, tracks)
+                        video_writer.write(vis_frame)
+
+                    if show_progress:
+                        pbar.update(1)
+
+        finally:
+            cap.release()
+            if video_writer:
+                video_writer.release()
+            if mot_writer:
+                mot_writer.close()
+            if show_progress:
+                pbar.close()
+
+        return all_tracks
 
     def process_frame(self, frame: np.ndarray, frame_id: int = None) -> Tuple[List, np.ndarray]:
         """Process a single frame.

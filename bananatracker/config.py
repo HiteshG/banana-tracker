@@ -46,6 +46,8 @@ class BananaTrackerConfig:
     special_classes: Optional[List[int]] = None
     detection_conf_thresh: float = 0.4  # Lower threshold to catch more objects
     detection_iou_thresh: float = 0.7   # IoU threshold for YOLO NMS
+    detection_batch_size: int = 16  # Batch size for YOLO inference
+    use_half_precision: bool = True  # FP16 inference for speed
 
     # Post-processing: Centroid-based deduplication (removes duplicate boxes for same object)
     centroid_dedup_enabled: bool = True
@@ -61,6 +63,10 @@ class BananaTrackerConfig:
 
     # Camera Motion Compensation
     cmc_method: str = "ecc"  # Enhanced correlation coefficient - more accurate
+    ecc_max_iterations: int = 100  # Reduced from 5000 for speed (still converges well)
+    ecc_termination_eps: float = 1e-5  # Slightly relaxed for speed
+    ecc_downscale: float = 0.25  # Process at 1/4 resolution (4x downscale)
+    cmc_downscale: int = 2  # Downscale for ORB/SIFT methods
 
     # Mask Module (SAM2.1 + Cutie)
     enable_masks: bool = False
@@ -70,6 +76,7 @@ class BananaTrackerConfig:
     hf_token: Optional[str] = None  # HuggingFace token for gated models
     mask_start_frame: int = 1  # Frame to start mask processing
     mask_bbox_overlap_threshold: float = 0.6  # Threshold for avoiding overlapped mask creation
+    sam2_use_fp16: bool = True  # Use FP16 for SAM2 inference
 
     # Visualization
     class_colors: Dict[str, Tuple[int, int, int]] = field(default_factory=dict)

@@ -26,9 +26,11 @@ class YOLOv8Detector:
         self.config = config
         self.model = YOLO(config.yolo_weights)
 
-        # Move to device
+        # Move to device and optionally use FP16
         if config.device.startswith('cuda'):
             self.model.to(config.device)
+            if config.use_half_precision:
+                self.model.half()
 
     def detect(self, frame: np.ndarray) -> np.ndarray:
         """Run detection on a frame.
@@ -48,7 +50,8 @@ class YOLOv8Detector:
             frame,
             verbose=False,
             conf=self.config.detection_conf_thresh,
-            iou=self.config.detection_iou_thresh
+            iou=self.config.detection_iou_thresh,
+            half=self.config.use_half_precision
         )
 
         if len(results) == 0 or results[0].boxes is None:
@@ -78,6 +81,56 @@ class YOLOv8Detector:
         detections = self._filter_special_classes(detections)
 
         return detections
+
+    def detect_batch(self, frames: List[np.ndarray]) -> List[np.ndarray]:
+        """Run detection on multiple frames in a batch.
+
+        Ultralytics YOLO natively supports batch inference when passed a list.
+
+        Parameters
+        ----------
+        frames : List[np.ndarray]
+            List of BGR image frames.
+
+        Returns
+        -------
+        all_detections : List[np.ndarray]
+            List of detection arrays, each of shape (N, 6): [x1, y1, x2, y2, conf, class_id]
+        """
+        if len(frames) == 0:
+            return []
+
+        # Run batch inference - Ultralytics handles list input natively
+        results = self.model(
+            frames,
+            verbose=False,
+            conf=self.config.detection_conf_thresh,
+            iou=self.config.detection_iou_thresh,
+            half=self.config.use_half_precision
+        )
+
+        all_detections = []
+        for result in results:
+            if result.boxes is None or len(result.boxes) == 0:
+                all_detections.append(np.empty((0, 6)))
+                continue
+
+            boxes = result.boxes
+            xyxy = boxes.xyxy.cpu().numpy()
+            conf = boxes.conf.cpu().numpy()
+            cls = boxes.cls.cpu().numpy()
+
+            detections = np.column_stack([xyxy, conf, cls])
+
+            # Apply filtering
+            detections = self._filter_by_track_classes(detections)
+            if self.config.centroid_dedup_enabled:
+                detections = self._deduplicate_by_centroid(detections)
+            detections = self._filter_special_classes(detections)
+
+            all_detections.append(detections)
+
+        return all_detections
 
     def _filter_by_track_classes(self, detections: np.ndarray) -> np.ndarray:
         """Filter detections to only include tracked classes.

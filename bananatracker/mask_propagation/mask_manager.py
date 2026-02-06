@@ -42,7 +42,8 @@ class MaskManager:
         device: str = "cuda:0",
         hf_token: Optional[str] = None,
         mask_start_frame: int = 1,
-        bbox_overlap_threshold: float = 0.6
+        bbox_overlap_threshold: float = 0.6,
+        use_fp16: bool = True
     ):
         """Initialize SAM2.1 and Cutie models.
 
@@ -62,10 +63,13 @@ class MaskManager:
             Frame number to start mask processing
         bbox_overlap_threshold : float
             Threshold for avoiding overlapped mask creation
+        use_fp16 : bool
+            Whether to use FP16 for SAM2 inference (default: True)
         """
         self.device = device
         self.SAM_START_FRAME = mask_start_frame
         self.bbox_overlap_threshold = bbox_overlap_threshold
+        self.use_fp16 = use_fp16
 
         # State tracking
         self.masks = None
@@ -97,7 +101,10 @@ class MaskManager:
                 sam2_model_id,
                 token=token,
             )
-            self.sam2_model.to(device).eval()
+            self.sam2_model.to(device)
+            if self.use_fp16:
+                self.sam2_model.half()
+            self.sam2_model.eval()
             self._sam2_use_hf = True
             print("SAM2.1 loaded successfully via HuggingFace")
         except Exception as e:

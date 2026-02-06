@@ -223,7 +223,8 @@ class BananaTracker:
     """
 
     def __init__(self, track_thresh=0.6, track_buffer=30, match_thresh=0.8,
-                 frame_rate=30, cmc_method='orb'):
+                 frame_rate=30, cmc_method='orb', cmc_downscale=2,
+                 ecc_max_iterations=100, ecc_eps=1e-5, ecc_scale=0.25):
         """Initialize the tracker.
 
         Parameters
@@ -238,6 +239,14 @@ class BananaTracker:
             Video frame rate.
         cmc_method : str
             Camera motion compensation method.
+        cmc_downscale : int
+            Downscale factor for ORB/SIFT methods.
+        ecc_max_iterations : int
+            Maximum iterations for ECC (default: 100).
+        ecc_eps : float
+            Termination epsilon for ECC (default: 1e-5).
+        ecc_scale : float
+            Scale factor for ECC (0.25 = 4x downscale).
         """
         self.tracked_stracks = []  # type: list[STrack]
         self.lost_stracks = []  # type: list[STrack]
@@ -252,8 +261,15 @@ class BananaTracker:
         self.match_thresh = match_thresh
         self.kalman_filter = KalmanFilter()
 
-        # Camera motion compensation
-        self.gmc = GMC(method=cmc_method, verbose=None)
+        # Camera motion compensation with configurable ECC parameters
+        self.gmc = GMC(
+            method=cmc_method,
+            downscale=cmc_downscale,
+            verbose=None,
+            ecc_max_iterations=ecc_max_iterations,
+            ecc_eps=ecc_eps,
+            ecc_scale=ecc_scale
+        )
 
     def reset(self):
         """Reset the tracker state."""
@@ -311,12 +327,23 @@ class BananaTracker:
             matches, u_track, u_detection = matching.linear_assignment(dists_cp, thresh=max_cost)
             return matches, u_track, u_detection, dists_cp
 
+        # PRE-COMPUTE: valid mask and row/column counts (optimization)
+        valid_mask = dists <= max_cost
+        row_counts = valid_mask.sum(axis=1)
+        col_counts = valid_mask.sum(axis=0)
+
+        # PRE-COMPUTE: unique mask IDs (skip background 0)
+        unique_mask_ids = set(np.unique(prediction_mask).tolist())
+        unique_mask_ids.discard(0)
+
+        img_h, img_w = img_info[0], img_info[1]
+
         # Process each entry in the cost matrix
         for i in range(dists_cp.shape[0]):
             for j in range(dists_cp.shape[1]):
-                if dists[i, j] <= max_cost:
-                    # Check if there are other entries meeting the threshold
-                    if not (sum(dists[i, :] <= max_cost) > 1 or sum(dists[:, j] <= max_cost) > 1):
+                if valid_mask[i, j]:
+                    # Check if there are other entries meeting the threshold (using pre-computed counts)
+                    if not (row_counts[i] > 1 or col_counts[j] > 1):
                         # Clear match - set all others to high cost
                         dists_cp[i, :] += 10
                         dists_cp[:, j] += 10
@@ -330,12 +357,10 @@ class BananaTracker:
                         if strack_id in tracklet_mask_dict:
                             strack_mask_id = tracklet_mask_dict[strack_id]
 
-                            # Check if mask is visible on scene
-                            if strack_mask_id in list(np.unique(prediction_mask))[1:]:
+                            # Check if mask is visible on scene (using pre-computed unique IDs)
+                            if strack_mask_id in unique_mask_ids:
                                 # Check mask confidence
                                 if mask_avg_prob_dict.get(strack_mask_id, 0) >= MIN_MASK_AVG_CONF:
-                                    img_h, img_w = img_info[0], img_info[1]
-
                                     # Get detection coordinates
                                     x, y, w, h = det.tlwh
                                     x = max(0, int(x))
