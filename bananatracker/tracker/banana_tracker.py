@@ -20,12 +20,12 @@ from .basetrack import BaseTrack, TrackState
 
 # Constants for association steps
 MIN_MASK_AVG_CONF = 0.6
-MIN_MM1 = 0.9  # mc threshold
-MIN_MM2 = 0.05  # mf threshold
+MIN_MM1 = 0.7  # mc threshold - allow more mask usage
+MIN_MM2 = 0.15  # mf threshold - require meaningful mask fill
 
-MAX_COST_1ST_ASSOC_STEP = 0.95    # More lenient first match
-MAX_COST_2ND_ASSOC_STEP = 0.6     # More lenient low-conf match
-MAX_COST_UNCONFIRMED_ASSOC_STEP = 0.8  # More lenient unconfirmed
+MAX_COST_1ST_ASSOC_STEP = 0.85    # Require ~15% IoU minimum
+MAX_COST_2ND_ASSOC_STEP = 0.5     # Restored original
+MAX_COST_UNCONFIRMED_ASSOC_STEP = 0.7  # Restored original
 
 
 class STrack(BaseTrack):
