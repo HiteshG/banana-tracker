@@ -8,6 +8,7 @@ The masks are used to enrich the cost matrix in track association, improving
 tracking robustness especially when players are close together.
 """
 
+import gc
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -21,6 +22,9 @@ import torch.nn.functional as F
 OVERLAP_MEASURE_VARIANT = 1
 OVERLAP_VARIANT_2_GRID_STEP = 10
 MASK_CREATION_BBOX_OVERLAP_THRESHOLD = 0.6
+
+# Memory management - cleanup every N frames to prevent GPU OOM
+MEMORY_CLEANUP_INTERVAL = 5
 
 
 class MaskManager:
@@ -80,6 +84,9 @@ class MaskManager:
         self.num_objects = 0
         self.mask_prediction_prev_frame = None
         self.mask_color_dict = {}
+
+        # Frame counter for memory management
+        self._frame_counter = 0
 
         # Initialize SAM2.1 via HuggingFace
         print(f"Loading SAM2.1 model: {sam2_model_id}")
@@ -167,8 +174,10 @@ class MaskManager:
                     model_weights = torch.load(cutie_weights_path, map_location=self.device)
                     self.cutie.load_weights(model_weights)
 
-                    # Initialize inference core
-                    torch.cuda.empty_cache()
+                    # Initialize inference core with memory cleanup
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
                     self.processor = InferenceCore(self.cutie, cfg=cfg)
 
             print(f"Cutie loaded successfully from {cutie_weights_path}")
@@ -194,6 +203,13 @@ class MaskManager:
                 return path
 
         return None
+
+    def _cleanup_gpu_memory(self):
+        """Aggressively clean up GPU memory to prevent OOM."""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        gc.collect()
 
     def _sam2_predict_boxes(self, image: np.ndarray, boxes_xyxy: List[List[float]]) -> np.ndarray:
         """Generate masks for multiple bounding boxes using SAM2.1 (BATCHED).
@@ -243,7 +259,7 @@ class MaskManager:
 
             # Cleanup GPU memory after SAM2 inference
             del pred_masks, outputs, inputs
-            torch.cuda.empty_cache()
+            self._cleanup_gpu_memory()
 
             return masks
 
@@ -298,13 +314,14 @@ class MaskManager:
                 del pred_masks, outputs, inputs
 
             # Final cleanup after sequential processing
-            torch.cuda.empty_cache()
+            self._cleanup_gpu_memory()
 
             return np.stack(all_masks, axis=0)
 
         except Exception as e:
             print(f"Warning: SAM2.1 sequential prediction failed: {e}")
             print("Using bounding box fallback for masks")
+            self._cleanup_gpu_memory()
             return self._bbox_to_mask_fallback(image, boxes_xyxy)
 
     def _bbox_to_mask_fallback(self, image: np.ndarray, boxes_xyxy: List[List[float]]) -> np.ndarray:
@@ -380,6 +397,8 @@ class MaskManager:
             # Cutie not available, return empty results
             return None, {}, None, None
 
+        self._frame_counter += 1
+
         # Convert numpy arrays to torch tensors for Cutie
         frame_torch = self._image_to_torch(img_info['raw_img'])
         frame_torch_prev = self._image_to_torch(img_info_prev['raw_img'])
@@ -401,11 +420,15 @@ class MaskManager:
             with torch.no_grad():
                 prediction = self.processor.step(frame_torch)
 
-            # Periodic memory cleanup to prevent GPU OOM
-            if frame_id % 15 == 0:
-                torch.cuda.empty_cache()
-
+        # Store prediction
         self.prediction = prediction
+
+        # Cleanup frame tensors immediately after use
+        del frame_torch, frame_torch_prev
+
+        # Periodic aggressive memory cleanup to prevent GPU OOM
+        if self._frame_counter % MEMORY_CLEANUP_INTERVAL == 0:
+            self._cleanup_gpu_memory()
 
         mask_avg_prob_dict = None
         prediction_colors_preserved = None
@@ -500,7 +523,7 @@ class MaskManager:
 
         # Cleanup after initialization
         del mask_torch
-        torch.cuda.empty_cache()
+        self._cleanup_gpu_memory()
 
         return prediction
 
@@ -617,7 +640,7 @@ class MaskManager:
 
         # Cleanup after adding new masks
         del mask_prev_extended_torch
-        torch.cuda.empty_cache()
+        self._cleanup_gpu_memory()
 
         # Update dictionaries
         self.mask_color_counter = update_tracklet_mask_dict_after_mask_addition(
@@ -655,6 +678,9 @@ class MaskManager:
         self.mask_color_counter = update_tracklet_mask_dict_after_mask_removal(
             self.tracklet_mask_dict, self.mask_color_dict, mask_ids_to_be_removed
         )
+
+        # Cleanup after mask removal to free GPU memory
+        self._cleanup_gpu_memory()
 
     def post_process_mask(
         self, prediction: torch.Tensor

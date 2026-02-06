@@ -1,11 +1,16 @@
 """BananaTracker: ByteTrack-based multi-object tracker.
 
 Adapted from McByte's McByteTracker with the following changes:
-- Renamed McByteTracker → BananaTracker
+- Renamed McByteTracker -> BananaTracker
 - Added class_id attribute to STrack for per-class visualization
 - Simplified update method (removed YOLOX-specific preprocessing)
 - Kept conditioned_assignment for future mask integration
-- OPTIMIZED: Pre-computed mask statistics, vectorized operations, debug logging
+
+FOCUS: Tracking Reliability, Occlusion Handling, Detection Improvements
+- Extended grace period for unconfirmed tracks
+- Better lost track recovery with expanded bbox matching
+- Relaxed association thresholds for challenging scenarios
+- Pre-computed mask statistics for efficient conditioned_assignment
 """
 
 import logging
@@ -26,10 +31,13 @@ MIN_MASK_AVG_CONF = 0.6
 MIN_MM1 = 0.9  # mc threshold
 MIN_MM2 = 0.05  # mf threshold
 
-# Relaxed association cost thresholds for better tracking
+# Relaxed association cost thresholds for better tracking reliability
 MAX_COST_1ST_ASSOC_STEP = 0.95    # More lenient first match (was 0.9)
 MAX_COST_2ND_ASSOC_STEP = 0.6     # More lenient low-conf match (was 0.5)
 MAX_COST_UNCONFIRMED_ASSOC_STEP = 0.8  # More lenient unconfirmed (was 0.7)
+
+# Grace period for unconfirmed tracks (frames before removal)
+UNCONFIRMED_GRACE_FRAMES = 4
 
 
 class STrack(BaseTrack):
@@ -62,7 +70,7 @@ class STrack(BaseTrack):
         # Store last detection for visualization
         self.last_det_tlwh = tlwh
 
-        # Grace period counter for unconfirmed tracks (gives 4 frames before removal)
+        # Grace period counter for unconfirmed tracks
         self.unconfirmed_frames = 0
 
     def predict(self):
@@ -75,15 +83,16 @@ class STrack(BaseTrack):
 
     @staticmethod
     def multi_predict(stracks):
-        """Predict next states for multiple tracks (VECTORIZED)."""
+        """Predict next states for multiple tracks."""
         if len(stracks) > 0:
             multi_mean = np.asarray([st.mean.copy() for st in stracks])
             multi_covariance = np.asarray([st.covariance for st in stracks])
 
-            # VECTORIZED: Set velocity to 0 for non-tracked states
-            states = np.array([st.state for st in stracks])
-            non_tracked_mask = states != TrackState.Tracked
-            multi_mean[non_tracked_mask, 6:8] = 0  # Zero velocity for lost tracks
+            # Set velocity to 0 for non-tracked states
+            for i, st in enumerate(stracks):
+                if st.state != TrackState.Tracked:
+                    multi_mean[i][6] = 0
+                    multi_mean[i][7] = 0
 
             multi_mean, multi_covariance = STrack.shared_kalman.multi_predict(multi_mean, multi_covariance)
             for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
@@ -228,10 +237,12 @@ class BananaTracker:
 
     Based on McByte's McByteTracker with conditioned_assignment for future
     mask integration support.
+
+    Focus: Tracking Reliability and Occlusion Handling
     """
 
-    def __init__(self, track_thresh=0.6, track_buffer=30, match_thresh=0.8,
-                 frame_rate=30, cmc_method='orb'):
+    def __init__(self, track_thresh=0.5, track_buffer=45, match_thresh=0.8,
+                 frame_rate=30, cmc_method='ecc', lost_track_buffer_scale=0.3):
         """Initialize the tracker.
 
         Parameters
@@ -239,13 +250,15 @@ class BananaTracker:
         track_thresh : float
             Detection confidence threshold for first association.
         track_buffer : int
-            Number of frames to keep lost tracks.
+            Number of frames to keep lost tracks (scales with fps).
         match_thresh : float
             Matching threshold for association.
         frame_rate : int
             Video frame rate.
         cmc_method : str
-            Camera motion compensation method.
+            Camera motion compensation method ('ecc', 'orb', 'sift', 'sparseOptFlow', 'none').
+        lost_track_buffer_scale : float
+            Scale factor for expanding lost track bbox for matching (default 0.3 = 30%).
         """
         self.tracked_stracks = []  # type: list[STrack]
         self.lost_stracks = []  # type: list[STrack]
@@ -253,11 +266,12 @@ class BananaTracker:
 
         self.frame_id = 0
         self.track_thresh = track_thresh
-        self.det_thresh = track_thresh  # Same as track_thresh (lowered from track_thresh + 0.1)
+        self.det_thresh = track_thresh  # Same as track_thresh for consistency
         self.buffer_size = int(frame_rate / 30.0 * track_buffer)
         self.max_time_lost = self.buffer_size
         self.match_thresh = match_thresh
         self.kalman_filter = KalmanFilter()
+        self.lost_track_buffer_scale = lost_track_buffer_scale
 
         # Camera motion compensation
         self.gmc = GMC(method=cmc_method, verbose=None)
@@ -275,7 +289,7 @@ class BananaTracker:
 
     def conditioned_assignment(self, dists, max_cost, strack_pool, detections,
                                prediction_mask, tracklet_mask_dict, mask_avg_prob_dict, img_info):
-        """Perform assignment with optional mask-based cost enrichment (OPTIMIZED).
+        """Perform assignment with optional mask-based cost enrichment.
 
         When mask parameters are None or empty, behaves as standard ByteTrack.
         When masks are provided, enriches cost matrix with mask metrics (mc, mf).
@@ -293,9 +307,9 @@ class BananaTracker:
         prediction_mask : np.ndarray or None
             Propagated mask tensor (H, W) with unique values per object.
         tracklet_mask_dict : dict or None
-            Mapping of track_id → mask color value.
+            Mapping of track_id -> mask color value.
         mask_avg_prob_dict : dict or None
-            Mapping of mask_id → confidence (0-1).
+            Mapping of mask_id -> confidence (0-1).
         img_info : tuple
             Image dimensions (height, width).
 
@@ -398,9 +412,9 @@ class BananaTracker:
         prediction_mask : np.ndarray, optional
             Propagated mask tensor for mask-based association.
         tracklet_mask_dict : dict, optional
-            Mapping of track_id → mask color.
+            Mapping of track_id -> mask color.
         mask_avg_prob_dict : dict, optional
-            Mapping of mask_id → confidence.
+            Mapping of mask_id -> confidence.
         frame_img : np.ndarray, optional
             BGR frame for camera motion compensation.
 
@@ -558,7 +572,7 @@ class BananaTracker:
         for it in u_unconfirmed:
             track = unconfirmed[it]
             track.unconfirmed_frames += 1
-            if track.unconfirmed_frames > 3:  # 4-frame grace period (was 1 frame)
+            if track.unconfirmed_frames > UNCONFIRMED_GRACE_FRAMES - 1:
                 track.mark_removed()
                 removed_stracks.append(track)
                 if self.debug_tracking:

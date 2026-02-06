@@ -24,6 +24,14 @@ class YOLOv8Detector:
             Configuration object with detector settings.
         """
         self.config = config
+
+        # Validate weights path
+        if not config.yolo_weights:
+            raise ValueError(
+                "yolo_weights cannot be empty. Please provide a path to YOLO weights file "
+                "(e.g., 'yolov8n.pt', 'best.pt', or 'model.onnx')"
+            )
+
         self.model = YOLO(config.yolo_weights, task='detect')
 
         # Check if this is a PyTorch model (can use .to())
