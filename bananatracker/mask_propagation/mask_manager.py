@@ -240,6 +240,11 @@ class MaskManager:
                 align_corners=False
             )
             masks = (pred_masks.squeeze(1) > 0.5).cpu().numpy().astype(np.uint8)
+
+            # Cleanup GPU memory after SAM2 inference
+            del pred_masks, outputs, inputs
+            torch.cuda.empty_cache()
+
             return masks
 
         except Exception as e:
@@ -288,6 +293,12 @@ class MaskManager:
 
                 mask = (pred_masks.squeeze() > 0.5).cpu().numpy().astype(np.uint8)
                 all_masks.append(mask)
+
+                # Cleanup each iteration to prevent accumulation
+                del pred_masks, outputs, inputs
+
+            # Final cleanup after sequential processing
+            torch.cuda.empty_cache()
 
             return np.stack(all_masks, axis=0)
 
@@ -390,6 +401,10 @@ class MaskManager:
             with torch.no_grad():
                 prediction = self.processor.step(frame_torch)
 
+            # Periodic memory cleanup to prevent GPU OOM
+            if frame_id % 15 == 0:
+                torch.cuda.empty_cache()
+
         self.prediction = prediction
 
         mask_avg_prob_dict = None
@@ -482,6 +497,10 @@ class MaskManager:
         with torch.no_grad():
             _ = self.processor.step(frame_torch_prev, mask_torch[1:], idx_mask=False)
             prediction = self.processor.step(frame_torch)
+
+        # Cleanup after initialization
+        del mask_torch
+        torch.cuda.empty_cache()
 
         return prediction
 
@@ -595,6 +614,10 @@ class MaskManager:
                 frame_torch_prev, mask_prev_extended_torch[1:],
                 objects=self.current_object_list_cutie, idx_mask=False
             )
+
+        # Cleanup after adding new masks
+        del mask_prev_extended_torch
+        torch.cuda.empty_cache()
 
         # Update dictionaries
         self.mask_color_counter = update_tracklet_mask_dict_after_mask_addition(

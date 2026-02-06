@@ -53,7 +53,7 @@ class BananaTrackerConfig:
 
     # Tracker (ByteTrack params)
     track_thresh: float = 0.5  # Lowered from 0.6 to match more detections in first pass
-    track_buffer: int = 90     # Increased from 30 to 90 (3 seconds at 30fps for better occlusion handling)
+    track_buffer: int = 45     # 1.5 seconds at 30fps (balanced between memory and occlusion handling)
     match_thresh: float = 0.8
     fps: int = 30
 
