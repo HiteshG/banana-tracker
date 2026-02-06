@@ -34,11 +34,13 @@ class BananaTrackerPipeline:
 
         # Initialize components
         self.detector = YOLOv8Detector(config)
+        # Initialize tracker with default frame_rate=30
+        # Actual buffer_size is recalculated when processing video based on video fps
         self.tracker = BananaTracker(
             track_thresh=config.track_thresh,
             track_buffer=config.track_buffer,
             match_thresh=config.match_thresh,
-            frame_rate=config.fps,
+            frame_rate=30,  # Default; overridden by actual video fps in process_video()
             cmc_method=config.cmc_method
         )
         self.visualizer = TrackVisualizer(config)
@@ -100,10 +102,9 @@ class BananaTrackerPipeline:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # Update fps in tracker if different
-        if fps != self.config.fps:
-            self.tracker.buffer_size = int(fps / 30.0 * self.config.track_buffer)
-            self.tracker.max_time_lost = self.tracker.buffer_size
+        # Always update tracker buffer based on actual video fps
+        self.tracker.buffer_size = int(fps / 30.0 * self.config.track_buffer)
+        self.tracker.max_time_lost = self.tracker.buffer_size
 
         # Setup output writers
         video_writer = None
@@ -378,10 +379,9 @@ class BananaTrackerPipeline:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         fps = int(cap.get(cv2.CAP_PROP_FPS))
 
-        # Update tracker buffer if needed
-        if fps != self.config.fps:
-            self.tracker.buffer_size = int(fps / 30.0 * self.config.track_buffer)
-            self.tracker.max_time_lost = self.tracker.buffer_size
+        # Always update tracker buffer based on actual video fps
+        self.tracker.buffer_size = int(fps / 30.0 * self.config.track_buffer)
+        self.tracker.max_time_lost = self.tracker.buffer_size
 
         frame_id = 0
 

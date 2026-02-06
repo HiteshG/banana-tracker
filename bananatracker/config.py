@@ -16,9 +16,8 @@ class BananaTrackerConfig:
         detection_conf_thresh: Minimum confidence for detections
 
         track_thresh: High-confidence detection threshold for first association
-        track_buffer: Frames to keep lost tracks before removal
+        track_buffer: Frames to keep lost tracks before removal (auto-scaled by video fps)
         match_thresh: Association matching threshold
-        fps: Video frame rate (used for buffer calculation)
 
         cmc_method: Camera motion compensation method ("orb", "ecc", "sift", "sparseOptFlow", "none")
 
@@ -53,15 +52,15 @@ class BananaTrackerConfig:
 
     # Tracker (ByteTrack params)
     track_thresh: float = 0.5  # Lowered from 0.6 to match more detections in first pass
-    track_buffer: int = 45     # 1.5 seconds at 30fps (balanced between memory and occlusion handling)
+    track_buffer: int = 45     # Buffer in frames (actual duration depends on video fps)
     match_thresh: float = 0.8
-    fps: int = 30
+    # Note: fps is auto-detected from video in pipeline.process_video()
 
     # Lost track recovery
     lost_track_buffer_scale: float = 0.3  # Expand bbox by 30% for lost track matching
 
-    # Camera Motion Compensation
-    cmc_method: str = "orb"
+    # Camera Motion Compensation ("orb", "ecc", "sift", "sparseOptFlow", "none")
+    cmc_method: str = "ecc"  # ECC is better for fast motion/jitter (e.g., ice hockey)
 
     # Mask Module (SAM2.1 + Cutie)
     enable_masks: bool = False
